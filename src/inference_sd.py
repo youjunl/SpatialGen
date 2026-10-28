@@ -17,12 +17,19 @@ import accelerate
 import torch
 import torchvision
 import numpy as np
-import open3d as o3d
 from einops import rearrange
 from PIL import Image
 from transformers import CLIPTextModel, CLIPTokenizer
-from diffusers import DDIMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler, AutoencoderKL, AutoencoderTiny
-from diffusers import FluxControlNetModel, FluxControlPipeline
+from diffusers import DDIMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler, AutoencoderKL
+try:
+    from diffusers import AutoencoderTiny
+except ImportError:  # optional, only used by the FLUX text-to-scene pipeline
+    AutoencoderTiny = None
+try:
+    from diffusers import FluxControlNetModel, FluxControlPipeline
+except ImportError:  # optional, text-to-scene only
+    FluxControlNetModel = None
+    FluxControlPipeline = None
 
 from src.options import opt_dict, Options
 
@@ -34,6 +41,7 @@ from src.utils.misc import worker_init_fn, todevice
 from src.utils.vis_util import save_color_depth_image
 from src.utils.typing import *
 from src.utils.pcl_ops import rgbd_to_pointcloud, descale_depth
+from src.utils.ply_ops import PointCloud, write_ply
 from diffusers_spatialgen import SpatialGenDiffusionPipeline
 from diffusers_spatialgen import UNetMVMM2DConditionModel
 
@@ -44,6 +52,11 @@ from src.utils.depth_aligner import SmoothDepthAligner
 os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_autotune"
 
 logger = logging.getLogger(__name__)
+
+
+def write_point_cloud(path: str, point_cloud: PointCloud) -> None:
+    """Compatibility shim matching ``o3d.io.write_point_cloud``."""
+    write_ply(path, point_cloud.points, point_cloud.colors)
 
 
 def compose_fixed_view_indices(opt: Options, device: torch.device, num_in_views: int = 1, num_sample_views: int = 2):
@@ -493,7 +506,7 @@ def align_and_save_pointcloud(
     reference_renderings: Optional[Tuple] = None,
     input_depth_masks: Optional[Float[Tensor, "BNt 1 H W"]] = None,
     output_depth_masks: Optional[Float[Tensor, "BNt 1 H W"]] = None,
-) -> o3d.geometry.PointCloud:
+) -> PointCloud:
     """
     align and save input and output point cloud
 
@@ -514,7 +527,7 @@ def align_and_save_pointcloud(
         only_return_target_ply: bool, whether to return only the target point cloud
         reference_renderings: tuple, reference renderings for depth alignment
     Returns:
-        o3d.geometry.PointCloud: aligned point cloud
+        PointCloud: aligned point cloud
     """
     return_data_dict = {} if return_data_dict is None else return_data_dict
     os.makedirs(output_folder, exist_ok=True)
@@ -538,17 +551,17 @@ def align_and_save_pointcloud(
     filtered_input_depths = input_depths.permute(0, 2, 3, 1).cpu().numpy()
     filtered_output_depths = output_depths.permute(0, 2, 3, 1).cpu().numpy()
 
-    input_rgb_ply = o3d.geometry.PointCloud()
-    total_rgb_ply = o3d.geometry.PointCloud()
-    input_semantic_ply = o3d.geometry.PointCloud()
-    total_semantic_ply = o3d.geometry.PointCloud()
+    input_rgb_ply = PointCloud()
+    total_rgb_ply = PointCloud()
+    input_semantic_ply = PointCloud()
+    total_semantic_ply = PointCloud()
     img_height, img_width = input_rgbs.shape[1], input_rgbs.shape[2]
 
     depth_aligner = SmoothDepthAligner()
 
-    input_rgb_ply = o3d.geometry.PointCloud()
-    total_rgb_ply = o3d.geometry.PointCloud()
-    aligned_rgb_ply = o3d.geometry.PointCloud()
+    input_rgb_ply = PointCloud()
+    total_rgb_ply = PointCloud()
+    aligned_rgb_ply = PointCloud()
     img_height, img_width = input_rgbs.shape[1], input_rgbs.shape[2]
 
     save_data_dict = {}
@@ -574,13 +587,13 @@ def align_and_save_pointcloud(
         else:
             depth_map = depth[:, :, 2:3]
 
-        o3d_recon_ply = o3d.geometry.PointCloud()
-        o3d_recon_ply.points = o3d.utility.Vector3dVector(scene_coord_maps)
-        o3d_recon_ply.colors = o3d.utility.Vector3dVector((rgb / 255.0).reshape(-1, 3))
+        o3d_recon_ply = PointCloud()
+        o3d_recon_ply.points = np.asarray(scene_coord_maps)
+        o3d_recon_ply.colors = np.asarray((rgb / 255.0).reshape(-1, 3))
 
-        o3d_sem_ply = o3d.geometry.PointCloud()
-        o3d_sem_ply.points = o3d.utility.Vector3dVector(scene_coord_maps)
-        o3d_sem_ply.colors = o3d.utility.Vector3dVector((semantic / 255.0).reshape(-1, 3))
+        o3d_sem_ply = PointCloud()
+        o3d_sem_ply.points = np.asarray(scene_coord_maps)
+        o3d_sem_ply.colors = np.asarray((semantic / 255.0).reshape(-1, 3))
 
         input_rgb_ply += o3d_recon_ply
         input_semantic_ply += o3d_sem_ply
@@ -613,13 +626,13 @@ def align_and_save_pointcloud(
         else:
             depth_map = depth[:, :, 2:3]
 
-        o3d_recon_ply = o3d.geometry.PointCloud()
-        o3d_recon_ply.points = o3d.utility.Vector3dVector(scene_coord_maps)
-        o3d_recon_ply.colors = o3d.utility.Vector3dVector((rgb / 255.0).reshape(-1, 3))
+        o3d_recon_ply = PointCloud()
+        o3d_recon_ply.points = np.asarray(scene_coord_maps)
+        o3d_recon_ply.colors = np.asarray((rgb / 255.0).reshape(-1, 3))
 
-        o3d_sem_ply = o3d.geometry.PointCloud()
-        o3d_sem_ply.points = o3d.utility.Vector3dVector(scene_coord_maps)
-        o3d_sem_ply.colors = o3d.utility.Vector3dVector((semantic / 255.0).reshape(-1, 3))
+        o3d_sem_ply = PointCloud()
+        o3d_sem_ply.points = np.asarray(scene_coord_maps)
+        o3d_sem_ply.colors = np.asarray((semantic / 255.0).reshape(-1, 3))
 
         total_semantic_ply += o3d_sem_ply
         total_rgb_ply += o3d_recon_ply
@@ -663,12 +676,12 @@ def align_and_save_pointcloud(
             )
             aligned_rgb_ply += aligned_ply
 
-    o3d.io.write_point_cloud(os.path.join(output_folder, f"{prefix_str}input_rgb.ply"), input_rgb_ply)
-    o3d.io.write_point_cloud(os.path.join(output_folder, f"{prefix_str}total_rgb.ply"), total_rgb_ply)
-    o3d.io.write_point_cloud(os.path.join(output_folder, f"{prefix_str}input_semantic.ply"), input_semantic_ply)
-    o3d.io.write_point_cloud(os.path.join(output_folder, f"{prefix_str}total_semantic.ply"), total_semantic_ply)
+    write_point_cloud(os.path.join(output_folder, f"{prefix_str}input_rgb.ply"), input_rgb_ply)
+    write_point_cloud(os.path.join(output_folder, f"{prefix_str}total_rgb.ply"), total_rgb_ply)
+    write_point_cloud(os.path.join(output_folder, f"{prefix_str}input_semantic.ply"), input_semantic_ply)
+    write_point_cloud(os.path.join(output_folder, f"{prefix_str}total_semantic.ply"), total_semantic_ply)
     if aligned_rgb_ply.has_points():
-        o3d.io.write_point_cloud(os.path.join(output_folder, f"{prefix_str}aligned_rgb.ply"), aligned_rgb_ply)
+        write_point_cloud(os.path.join(output_folder, f"{prefix_str}aligned_rgb.ply"), aligned_rgb_ply)
 
     # save data into a npz file
     save_data_dict["input_rgbs"] = in_rgbs
@@ -1266,7 +1279,8 @@ def log_val_autoregressive_from_dataloader(
 
     pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
-    pipeline.enable_xformers_memory_efficient_attention()
+    # PyTorch SDPA is used by the custom attention processors; xformers is not
+    # required (and has no wheels for current Colab Python/Torch versions).
 
     if args.seed is None:
         generator = None
@@ -1516,17 +1530,17 @@ def log_val_autoregressive_from_dataloader(
             if round_idx == num_round - 1 or len(rest_view_ids) == 0:
                 # save the global scene ply
                 ply_path = os.path.join(room_output_folder, f"global_scene_ply.ply")
-                pcl = o3d.geometry.PointCloud()
-                pcl.points = o3d.utility.Vector3dVector(global_scene_ply[:, :3].cpu().numpy())
-                pcl.colors = o3d.utility.Vector3dVector(global_scene_ply[:, 3:].cpu().numpy())
-                o3d.io.write_point_cloud(ply_path, pcl)
+                pcl = PointCloud()
+                pcl.points = np.asarray(global_scene_ply[:, :3].cpu().numpy())
+                pcl.colors = np.asarray(global_scene_ply[:, 3:].cpu().numpy())
+                write_point_cloud(ply_path, pcl)
 
                 # save the global scene semantic ply
                 ply_path = os.path.join(room_output_folder, f"global_scene_sem_ply.ply")
-                pcl = o3d.geometry.PointCloud()
-                pcl.points = o3d.utility.Vector3dVector(global_scene_sem_ply[:, :3].cpu().numpy())
-                pcl.colors = o3d.utility.Vector3dVector(global_scene_sem_ply[:, 3:].cpu().numpy())
-                o3d.io.write_point_cloud(ply_path, pcl)
+                pcl = PointCloud()
+                pcl.points = np.asarray(global_scene_sem_ply[:, :3].cpu().numpy())
+                pcl.colors = np.asarray(global_scene_sem_ply[:, 3:].cpu().numpy())
+                write_point_cloud(ply_path, pcl)
                 torch.cuda.empty_cache()
                 gc.collect()
                 break
@@ -1641,6 +1655,11 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=2.0, help="CFG scale used for validation")
     parser.add_argument("--half_precision", action="store_true", help="Use half precision for inference")
     parser.add_argument("--allow_tf32", action="store_true", help="Enable TF32 for faster training on Ampere GPUs")
+    parser.add_argument(
+        "--skip_gs",
+        action="store_true",
+        help="Skip Sparse-RaDeGS reconstruction/video rendering (recommended on Colab T4)",
+    )
 
     parser.add_argument("--image_path", type=str, default=None, help="Path to the image for reconstruction")
     parser.add_argument(
@@ -1819,7 +1838,7 @@ def main():
         safety_checker=None,
         feature_extractor=None,
     )
-    pipeline.unet.enable_xformers_memory_efficient_attention()
+    # xformers is not needed: the custom attention processors use PyTorch SDPA.
 
     pipeline.to(device).to(dtype=weight_dtype)
     pipeline.set_progress_bar_config(disable=True)
@@ -1887,6 +1906,13 @@ def main():
     ##################
     ### gaussian reconstruction and video rendering ###
     ##################
+    if args.skip_gs:
+        logger.info(
+            "Skipping Sparse-RaDeGS reconstruction. RGB/depth/semantic predictions and PLY files are saved under "
+            f"{infer_dir}"
+        )
+        return
+
     infer_dir = os.path.abspath(infer_dir)
     room_output_folders = [
         f

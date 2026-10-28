@@ -306,8 +306,6 @@ def project_points(points: torch.Tensor, extrinsic: torch.Tensor):
     points = points[:,:,:3] / points[:, :, 3:]
     return points
 
-import open3d as o3d
-
 def cvt_to_perspective_pointcloud(rgb_image: torch.Tensor,
                                   depth_image: torch.Tensor, 
                                   depth_scale: float = 1.0,
@@ -316,8 +314,10 @@ def cvt_to_perspective_pointcloud(rgb_image: torch.Tensor,
     """
     rgb: (3, H, W)
     depth: (1, H, W)
-    
+
     """
+    import open3d as o3d
+
     C, H, W = depth_image.shape
     K = torch.tensor([
                 [1 / np.tan(wfov_rad / 2.), 0., 0., 0.],

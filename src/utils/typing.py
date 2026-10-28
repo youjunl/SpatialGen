@@ -36,7 +36,12 @@ from omegaconf import DictConfig
 # PyTorch Tensor type
 from torch import Tensor
 
-# Runtime type checking decorator
-from typeguard import typechecked as typechecker
+# Runtime type checking decorator (optional dependency)
+try:
+    from typeguard import typechecked as typechecker
+except ImportError:
+
+    def typechecker(func):
+        return func
 
 import numpy as np

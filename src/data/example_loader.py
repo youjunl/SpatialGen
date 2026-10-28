@@ -61,7 +61,10 @@ from src.utils.layout_utils import (
     SDCMeshRenderer,
     parse_spatiallm_obj_bbox_from_meta,
 )
-from pytorch3d.utils.camera_conversions import cameras_from_opencv_projection
+try:
+    from pytorch3d.utils.camera_conversions import cameras_from_opencv_projection
+except ImportError:  # optional; only used by the SpatialLM dataset
+    cameras_from_opencv_projection = None
 
 
 def get_koolai_room_ids(data_dir: str, split_filepath: str, invalid_split_filepath: str = None):
@@ -187,7 +190,7 @@ class ExampleDataset(Dataset):
         elif "spatiallm" == self.load_dataset:
             self.samples = get_spatiallm_room_ids(data_dir=data_dir)
 
-        if self.use_layout_prior_from_p3d:
+        if self.use_layout_prior_from_p3d and self.load_dataset == "spatiallm":
             self.cuda_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
             self.p3d_renderer = SDCMeshRenderer(
                 cameras=None, image_size=(self.image_width, self.image_height), device=self.cuda_device

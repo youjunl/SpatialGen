@@ -1,4 +1,8 @@
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from einops import rearrange
 
@@ -105,6 +109,209 @@ class JointMVAttnProcessor2_0:
             return hidden_states, encoder_hidden_states
         else:
             return hidden_states
+
+
+class MVMMAttnProcessor2_0:
+    """PyTorch SDPA replacement for :class:`XFormersMVAttnProcessor`.
+
+    Performs multi-view self-attention by concatenating the token sequences of
+    all views along the sequence dimension.  This mirrors the xformers
+    implementation while relying only on PyTorch's built-in SDPA, which has a
+    memory-efficient kernel on T4.
+    """
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("MVMMAttnProcessor2_0 requires PyTorch >= 2.0.")
+
+    def __call__(
+        self,
+        attn: "Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        num_input_views: int = 4,
+        num_output_views: int = 4,
+        multiview_attention: bool = True,
+        sparse_mv_attention: bool = False,
+        num_views: Optional[int] = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        num_all_views = num_input_views + num_output_views
+        if num_views is None:
+            num_views = num_all_views
+
+        batch_size = hidden_states.shape[0]
+        key_tokens = hidden_states.shape[1]
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, key_tokens, batch_size)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        if multiview_attention:
+            query = rearrange(query, "(b v) l d -> b (v l) d", v=num_views)
+            key = rearrange(key, "(b v) l d -> b (v l) d", v=num_views)
+            value = rearrange(value, "(b v) l d -> b (v l) d", v=num_views)
+            batch_size = batch_size // num_views
+
+        head_dim = query.shape[-1] // attn.heads
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        if attention_mask is not None:
+            # ``prepare_attention_mask`` returns (batch * heads, q, k); SDPA
+            # expects a mask broadcastable to (batch, heads, q, k).
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+            if multiview_attention:
+                # The mask covers one view; the MV attention key/query span all
+                # views, so a mask would need to be tiled over the view axis.
+                raise NotImplementedError("attention masks are not supported with multiview attention")
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask,
+            dropout_p=0.0 if not attn.training else attn.dropout, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if multiview_attention:
+            hidden_states = rearrange(hidden_states, "b (v l) d -> (b v) l d", v=num_views)
+            batch_size = batch_size * num_views
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        return hidden_states / attn.rescale_output_factor
+
+
+class JointTaskAttnProcessor2_0:
+    """PyTorch SDPA replacement for :class:`XFormersJointAttnProcessor`.
+
+    Fuses the tokens of different modalities / tasks for the same view.
+    """
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("JointTaskAttnProcessor2_0 requires PyTorch >= 2.0.")
+
+    def __call__(
+        self,
+        attn: "Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        num_tasks: int = 2,
+        num_input_views: int = 4,
+        num_output_views: int = 4,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        num_all_views = num_input_views + num_output_views
+        batch_size = hidden_states.shape[0]
+        sequence_length = hidden_states.shape[1]
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        if num_tasks > 1:
+            query = rearrange(query, "(b n_t v) l d -> (b v) (n_t l) d", n_t=num_tasks, v=num_all_views)
+            key = rearrange(key, "(b n_t v) l d -> (b v) (n_t l) d", n_t=num_tasks, v=num_all_views)
+            value = rearrange(value, "(b n_t v) l d -> (b v) (n_t l) d", n_t=num_tasks, v=num_all_views)
+
+        batch_size = query.shape[0]
+        head_dim = query.shape[-1] // attn.heads
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask,
+            dropout_p=0.0 if not attn.training else attn.dropout, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if num_tasks > 1:
+            hidden_states = rearrange(
+                hidden_states, "(b v) (n_t l) d -> (b n_t v) l d", n_t=num_tasks, v=num_all_views
+            )
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        return hidden_states / attn.rescale_output_factor
 
 
 # Copied from diffusers.models.attention_processor.AttnProcessor2_0

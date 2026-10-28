@@ -1,86 +1,109 @@
-import torch
-import torch.nn as nn
-import numpy as np
-import open3d as o3d
+"""Pure-PyTorch point-cloud rasterisation.
 
-# Data structures and functions for rendering
-from pytorch3d.structures import Pointclouds
-from pytorch3d.renderer import (
-    PointsRasterizationSettings,
-    # PointsRenderer,
-    PerspectiveCameras,
-    PointsRasterizer,
-    AlphaCompositor,
-)
-from pytorch3d.utils import cameras_from_opencv_projection
-from torchvision.utils import save_image
+The original implementation depended on pytorch3d's ``PointsRasterizer`` and
+``AlphaCompositor``.  pytorch3d has no wheels for current Colab Python/Torch
+versions, so this module provides a small z-buffered point splatter with the
+same input/output contract.  It is used to warp the input view into the target
+views (the ``warpped_target_rgbs`` conditioning image).
+"""
+
+import torch
 
 from src.utils.typing import *
 
 
-# A renderer class should be initialized with a
-# function for rasterization and a function for compositing.
-# The rasterizer should:
-#     - transform inputs from world -> screen space
-#     - rasterize inputs
-#     - return fragments
-# The compositor can take fragments as input along with any other properties of
-# the scene and generate images.
+def _splat_single_view(
+    points: torch.Tensor,
+    colors: torch.Tensor,
+    c2w: torch.Tensor,
+    intrinsic: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    point_radius_ndc: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Render one view.
 
-# E.g. rasterize inputs and then shade
-#
-# fragments = self.rasterize(point_clouds)
-# images = self.compositor(fragments, point_clouds)
-# return images
+    Args:
+        points: (N, 3) world-space points.
+        colors: (N, 3) RGB values in [0, 1].
+        c2w: (4, 4) camera-to-world transform.
+        intrinsic: (3, 3) OpenCV camera matrix at the target resolution.
+        point_radius_ndc: splat radius in normalised device coordinates
+            (pytorch3d convention: 1.0 spans half the image width).
 
-
-class CustomPointsRenderer(nn.Module):
+    Returns:
+        rgb: (3, H, W) float tensor in [0, 1].
+        depth: (1, H, W) camera-space depth, zero where no point projects.
     """
-    A class for rendering a batch of points. The class should
-    be initialized with a rasterizer and compositor class which each have a forward
-    function.
+    device = points.device
+    dtype = points.dtype
+    height, width = image_height, image_width
 
-    The points are rendered with with varying alpha (weights) values depending on
-    the distance of the pixel center to the true point in the xy plane. The purpose
-    of this is to soften the hard decision boundary, for differentiability.
-    See Section 3.2 of "SynSin: End-to-end View Synthesis from a Single Image"
-    (https://arxiv.org/pdf/1912.08804.pdf) for more details.
-    """
+    w2c = torch.inverse(c2w.to(dtype))
+    rotation, translation = w2c[:3, :3], w2c[:3, 3]
+    cam_points = points @ rotation.transpose(0, 1) + translation
 
-    def __init__(self, rasterizer, compositor, min_depth: float=0.01) -> None:
-        super().__init__()
-        self.rasterizer = rasterizer
-        self.compositor = compositor
-        self.min_depth = min_depth
+    z = cam_points[:, 2]
+    valid = z > 1e-4
 
-    def to(self, device):
-        # Manually move to device rasterizer as the cameras
-        # within the class are not of type nn.Module
-        self.rasterizer = self.rasterizer.to(device)
-        self.compositor = self.compositor.to(device)
-        return self
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    safe_z = torch.where(valid, z, torch.ones_like(z))
+    u = fx * cam_points[:, 0] / safe_z + cx
+    v = fy * cam_points[:, 1] / safe_z + cy
+    ui = torch.round(u).long()
+    vi = torch.round(v).long()
 
-    def forward(self, point_clouds: Pointclouds, **kwargs) -> torch.Tensor:
-        fragments = self.rasterizer(point_clouds, **kwargs)
-        
-        # Construct weights based on the distance of a point to the true point.
-        # However, this could be done differently: e.g. predicted as opposed
-        # to a function of the weights.
-        r = self.rasterizer.raster_settings.radius
+    radius_px = max(1.0, float(point_radius_ndc) * width / 2.0)
+    radius_int = int(torch.ceil(torch.tensor(radius_px)).item())
+    radius_sq = radius_px * radius_px
 
-        dists2 = fragments.dists.permute(0, 3, 1, 2)
-        weights = 1 - dists2 / (r * r)
-        images = self.compositor(
-            fragments.idx.long().permute(0, 3, 1, 2),
-            weights,
-            point_clouds.features_packed().permute(1, 0),
-            **kwargs,
-        )
+    offsets = []
+    for dy in range(-radius_int, radius_int + 1):
+        for dx in range(-radius_int, radius_int + 1):
+            dist_sq = float(dx * dx + dy * dy)
+            if dist_sq <= radius_sq:
+                offsets.append((dx, dy, max(1e-3, 1.0 - dist_sq / radius_sq)))
 
-        # permute so image comes at the end
-        images = images.permute(0, 2, 3, 1)
+    flat_depth = torch.full((height * width,), float("inf"), device=device, dtype=dtype)
 
-        return images, fragments.zbuf
+    # Pass 1: nearest-surface z-buffer.
+    for dx, dy, _ in offsets:
+        px = ui + dx
+        py = vi + dy
+        inside = valid & (px >= 0) & (px < width) & (py >= 0) & (py < height)
+        if not inside.any():
+            continue
+        flat_idx = py[inside] * width + px[inside]
+        flat_depth.scatter_reduce_(0, flat_idx, z[inside], reduce="amin", include_self=True)
+
+    # Pass 2: average colours of the points lying on the nearest surface.
+    accum_rgb = torch.zeros((height * width, 3), device=device, dtype=dtype)
+    accum_weight = torch.zeros((height * width,), device=device, dtype=dtype)
+    for dx, dy, weight in offsets:
+        px = ui + dx
+        py = vi + dy
+        inside = valid & (px >= 0) & (px < width) & (py >= 0) & (py < height)
+        if not inside.any():
+            continue
+        flat_idx = py[inside] * width + px[inside]
+        point_depth = z[inside]
+        # Accept points within a small tolerance of the nearest surface to
+        # soften the splat without blending across depth discontinuities.
+        near = point_depth <= flat_depth[flat_idx] * 1.02 + 1e-3
+        if not near.any():
+            continue
+        selected_idx = flat_idx[near]
+        selected_weight = torch.full_like(point_depth[near], weight)
+        accum_rgb.index_add_(0, selected_idx, colors[inside][near] * selected_weight[:, None])
+        accum_weight.index_add_(0, selected_idx, selected_weight)
+
+    rgb = accum_rgb / accum_weight.clamp_min(1e-6)[:, None]
+    rgb = rgb.reshape(height, width, 3).permute(2, 0, 1).contiguous()
+
+    depth = flat_depth.reshape(height, width)
+    depth = torch.where(torch.isfinite(depth), depth, torch.zeros_like(depth))
+    return rgb, depth.unsqueeze(0)
 
 
 def torch3d_rasterize_points(
@@ -91,59 +114,39 @@ def torch3d_rasterize_points(
     image_height: int = 256,
     point_radius: float = 0.01,
     device: str = "cuda",
-) -> Float[Tensor, "B 3 H W"]:
+) -> Tuple[Float[Tensor, "B 3 H W"], Float[Tensor, "B 1 H W"]]:
+    """Rasterise a coloured point cloud into a batch of camera views.
 
-    # Initialize a camera.
-    cv_cam_poses_w2c = torch.inverse(cv_cam_poses_c2w)
-    Rs = cv_cam_poses_w2c[:, :3, :3].to(device)
-    Ts = cv_cam_poses_w2c[:, :3, 3].to(device)
-    img_size = torch.tensor([image_height, image_width])[None, :].repeat(cv_cam_poses_w2c.shape[0], 1).to(device)
-    K = torch.tensor([[intrinsic[0, 0], 0, intrinsic[0, 2], 0], [0, intrinsic[1, 1], intrinsic[1, 2], 0], [0, 0, 1, 0], [0, 0, 0, 1]])[None, :, :]
-    K = K.repeat(cv_cam_poses_w2c.shape[0], 1, 1).to(device)
-
-    # Define the settings for rasterization and shading. Here we set the output image to be of size
-    raster_settings = PointsRasterizationSettings(image_size=[image_height, image_width], 
-                                                  radius=point_radius, 
-                                                  points_per_pixel=10,
-                                                  max_points_per_bin=1000000)
-
-    torch3d_pointcloud = Pointclouds(points=[in_pointcloud[:, :3]], features=[in_pointcloud[:, 3:]])
+    Drop-in replacement for the previous pytorch3d implementation.  Returns
+    RGB in [0, 1] and camera-space depth maps.
+    """
+    device = torch.device(device)
+    c2w = cv_cam_poses_c2w.to(device=device, dtype=torch.float32)
+    points = in_pointcloud[:, :3].to(device=device, dtype=torch.float32)
+    colors = in_pointcloud[:, 3:6].to(device=device, dtype=torch.float32)
+    intrinsic = intrinsic.to(device=device, dtype=torch.float32)
 
     rendered_rgbs = []
-    rendered_dpths = []
-    for idx in range(Rs.shape[0]):
-        R = Rs[idx : idx + 1]
-        tvec = Ts[idx : idx + 1]
-        k = K[idx : idx + 1]
-        image_size = img_size[idx : idx + 1]
-        camera = cameras_from_opencv_projection(R=R, tvec=tvec, camera_matrix=k, image_size=image_size)
+    rendered_depths = []
+    for idx in range(c2w.shape[0]):
+        rgb, depth = _splat_single_view(
+            points=points,
+            colors=colors,
+            c2w=c2w[idx],
+            intrinsic=intrinsic,
+            image_width=image_width,
+            image_height=image_height,
+            point_radius_ndc=point_radius,
+        )
+        rendered_rgbs.append(rgb)
+        rendered_depths.append(depth)
 
-        # Create a points renderer by compositing points using an alpha compositor (nearer points
-        # are weighted more heavily). See [1] for an explanation.
-        rasterizer = PointsRasterizer(cameras=camera, raster_settings=raster_settings)
-        renderer = CustomPointsRenderer(rasterizer=rasterizer, 
-                                        compositor=AlphaCompositor(background_color=(0., 0., 0.)))
-        rendered_rgb, rendered_dpth = renderer(torch3d_pointcloud)
-        rendered_rgbs.append(rendered_rgb)
-        rendered_dpths.append(rendered_dpth)
+    if len(rendered_rgbs) == 0:
+        empty_rgb = torch.zeros((0, 3, image_height, image_width), device=device)
+        empty_depth = torch.zeros((0, 1, image_height, image_width), device=device)
+        return empty_rgb, empty_depth
 
-    rendered_rgbs = torch.cat(rendered_rgbs, dim=0)
-    rendered_dpths = torch.cat(rendered_dpths, dim=0)
-    # breakpoint()
-    # visualize the rendered rgb and depth
-    # from matplotlib import pyplot as plt
-    # fig, axs = plt.subplots(1, 2, figsize=(20, 10))
-    # rgb_0 = rendered_rgbs[1].cpu().numpy()
-    # axs[0].imshow(rgb_0)
-    # axs[0].axis("off")
-    # axs[0].set_title("Rendered RGB")
-    # depth_0 = rendered_dpths[1, :,:, 0].cpu().numpy()
-    # axs[1].imshow(depth_0)
-    # axs[1].axis("off")
-    # axs[1].set_title("Rendered Depth")
-    # plt.savefig("rendered_rgb_depth.png")
-    torch.cuda.empty_cache()
-    return rendered_rgbs.permute(0, 3, 1, 2), rendered_dpths[:, :, :, 0:1].permute(0, 3, 1, 2)
+    return torch.stack(rendered_rgbs, dim=0), torch.stack(rendered_depths, dim=0)
 
 
 def render_rgb_and_depth_from_ply(

@@ -1,4 +1,9 @@
 import copy
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from diffusers import __version__
 from diffusers.models.modeling_utils import (
@@ -7,6 +12,18 @@ from diffusers.models.modeling_utils import (
 )
 from diffusers.models.modeling_utils import *
 from diffusers.models.unets.unet_2d_condition import *
+from diffusers.models.attention_processor import AttentionProcessor
+
+try:
+    from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
+except ImportError:  # PEFT integration is optional at inference time
+    USE_PEFT_BACKEND = False
+
+    def scale_lora_layers(*args, **kwargs):
+        pass
+
+    def unscale_lora_layers(*args, **kwargs):
+        pass
 
 from .unet_mv2d_blocks import get_down_mvblock, get_mid_mvblock, get_up_mvblock
 
@@ -1535,8 +1552,9 @@ class UNetMV2DConditionModel(
                     # if device_map is None, load the state dict and move the params from meta device to the cpu
                     if device_map is None and not is_sharded:
                         param_device = "cpu"
-                        state_dict = load_state_dict(model_file, variant=variant)
-                        model._convert_deprecated_attention_blocks(state_dict)
+                        state_dict = load_state_dict(model_file)
+                        if hasattr(model, "_convert_deprecated_attention_blocks"):
+                            model._convert_deprecated_attention_blocks(state_dict)
                         # move the params from meta device to cpu
                         missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
                         if len(missing_keys) > 0:
@@ -1629,17 +1647,37 @@ class UNetMV2DConditionModel(
                 model = cls.from_config(config, **unused_kwargs)
 
                 if not from_scratch:
-                    state_dict = load_state_dict(model_file, variant=variant)
-                    model._convert_deprecated_attention_blocks(state_dict)
+                    state_dict = load_state_dict(model_file)
+                    if hasattr(model, "_convert_deprecated_attention_blocks"):
+                        model._convert_deprecated_attention_blocks(state_dict)
                     state_dict_original = copy.deepcopy(state_dict)
 
-                    model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
-                        model,
-                        state_dict,
-                        model_file,
-                        pretrained_model_name_or_path,
-                        ignore_mismatched_sizes=ignore_mismatched_sizes,
-                    )
+                    try:
+                        model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
+                            model,
+                            state_dict,
+                            model_file,
+                            pretrained_model_name_or_path,
+                            ignore_mismatched_sizes=ignore_mismatched_sizes,
+                        )
+                    except (TypeError, ValueError):
+                        # diffusers >= 0.35 requires additional private arguments in
+                        # `_load_pretrained_model`; fall back to a shape-filtered load.
+                        model_sd = model.state_dict()
+                        filtered_state_dict = {}
+                        mismatched_keys = []
+                        for key, value in state_dict.items():
+                            if key in model_sd:
+                                if model_sd[key].shape == value.shape:
+                                    filtered_state_dict[key] = value
+                                else:
+                                    mismatched_keys.append(
+                                        (key, tuple(model_sd[key].shape), tuple(value.shape))
+                                    )
+                        missing_keys = [key for key in model_sd if key not in filtered_state_dict]
+                        unexpected_keys = [key for key in state_dict if key not in model_sd]
+                        model.load_state_dict(filtered_state_dict, strict=False)
+                        error_msgs = []
 
                     loading_info = {
                         "missing_keys": missing_keys,

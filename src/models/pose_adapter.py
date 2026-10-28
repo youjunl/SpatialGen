@@ -173,12 +173,10 @@ class RayMapEncoder(ModelMixin, ConfigMixin):
             "file_type": "model",
             "framework": "pytorch",
         }
-        # load config
-        config, unused_kwargs, commit_hash = cls.load_config(
-            config_path,
+        # load config (``return_commit_hash`` was removed from newer diffusers)
+        load_config_kwargs = dict(
             cache_dir=cache_dir,
             return_unused_kwargs=True,
-            return_commit_hash=True,
             force_download=force_download,
             proxies=proxies,
             local_files_only=local_files_only,
@@ -188,6 +186,12 @@ class RayMapEncoder(ModelMixin, ConfigMixin):
             user_agent=user_agent,
             **kwargs,
         )
+        try:
+            config, unused_kwargs, commit_hash = cls.load_config(
+                config_path, return_commit_hash=True, **load_config_kwargs
+            )
+        except TypeError:
+            config, unused_kwargs = cls.load_config(config_path, **load_config_kwargs)
         init_dict, unused_kwargs, hidden_dict = cls.extract_init_dict(config, **kwargs)
 
         # Initialize model with the config

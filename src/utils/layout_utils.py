@@ -3,6 +3,7 @@ import shapely
 from shapely.geometry import Polygon, MultiLineString
 import trimesh
 import torch
+import torch.nn as nn
 from numpy import typing as npt
 from collections import defaultdict
 from typing import Dict, Any, Union, Sequence
@@ -3522,7 +3523,63 @@ def parse_spatiallm_obj_bbox_from_meta(layout_meta_dict: Dict[str, Any], room_fo
     else:
         return object_bbox_dict, return_mesh_list
     
-from pytorch3d.structures import Meshes
+try:
+    import pytorch3d  # noqa: F401
+
+    from pytorch3d.structures import Meshes
+
+    # sdc pytorch3d renderer for rendering segmentation, id?, depth, and scene coordinate map
+    from typing import Tuple
+    import torch
+    import torch.nn as nn
+
+    from pytorch3d.renderer.cameras import CamerasBase
+    from pytorch3d.structures import join_meshes_as_scene
+    from pytorch3d.renderer import (
+        RasterizationSettings,
+        MeshRasterizer
+    )
+
+    from pytorch3d.vis.plotly_vis import AxisArgs, plot_batch_individually, plot_scene
+    from pytorch3d.vis.texture_vis import texturesuv_image_matplotlib
+    from pytorch3d.renderer import (
+        look_at_view_transform,
+        FoVPerspectiveCameras,
+        PointLights,
+        DirectionalLights,
+        Materials,
+        RasterizationSettings,
+        MeshRenderer,
+        MeshRasterizer,
+        SoftPhongShader,
+        SoftSilhouetteShader,
+        Textures,
+        TexturesUV,
+        TexturesVertex, TexturesAtlas
+    )
+except ImportError:  # pytorch3d is optional; only needed for the SpatialLM loader
+    Meshes = None
+    CamerasBase = object
+    join_meshes_as_scene = None
+    RasterizationSettings = None
+    MeshRasterizer = None
+    AxisArgs = None
+    plot_batch_individually = None
+    plot_scene = None
+    texturesuv_image_matplotlib = None
+    look_at_view_transform = None
+    FoVPerspectiveCameras = None
+    PointLights = None
+    DirectionalLights = None
+    Materials = None
+    MeshRenderer = None
+    SoftPhongShader = None
+    SoftSilhouetteShader = None
+    Textures = None
+    TexturesUV = None
+    TexturesVertex = None
+    TexturesAtlas = None
+
 
 def trimesh_to_p3dmesh(trimesh_mesh: trimesh.Trimesh):
     vertices,faces,new_idx = trimesh.remesh.subdivide_to_size(trimesh_mesh.vertices, trimesh_mesh.faces, max_edge=0.2, return_index=True)
@@ -3533,37 +3590,6 @@ def trimesh_to_p3dmesh(trimesh_mesh: trimesh.Trimesh):
     
     return p3d_mesh,face_color
 
-
-# sdc pytorch3d renderer for rendering segmentation, id?, depth, and scene coordinate map
-from typing import Tuple
-import torch
-import torch.nn as nn
-
-from pytorch3d.renderer.cameras import CamerasBase
-from pytorch3d.structures import join_meshes_as_scene
-from pytorch3d.renderer import (
-    RasterizationSettings, 
-    MeshRasterizer
-)
-
-from pytorch3d.structures import Meshes
-from pytorch3d.vis.plotly_vis import AxisArgs, plot_batch_individually, plot_scene
-from pytorch3d.vis.texture_vis import texturesuv_image_matplotlib
-from pytorch3d.renderer import (
-    look_at_view_transform,
-    FoVPerspectiveCameras, 
-    PointLights, 
-    DirectionalLights, 
-    Materials, 
-    RasterizationSettings, 
-    MeshRenderer, 
-    MeshRasterizer,  
-    SoftPhongShader,
-    SoftSilhouetteShader,
-    Textures,
-    TexturesUV,
-    TexturesVertex,TexturesAtlas
-)
 
 class SDCMeshRenderer(nn.Module):
     def __init__(self, 

@@ -1,0 +1,12 @@
+# Extra packages needed to run SpatialGen inference on a current Google Colab
+# runtime.  Colab already provides torch, torchvision, diffusers, transformers,
+# accelerate, numpy, opencv-python, matplotlib, scipy and Pillow, so they are
+# deliberately not pinned here (pinning them is what broke the old setup).
+einops
+omegaconf
+shapely
+trimesh
+jaxtyping
+typeguard
+icecream
+plyfile

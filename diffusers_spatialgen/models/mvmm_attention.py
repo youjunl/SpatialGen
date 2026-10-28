@@ -1,9 +1,21 @@
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from einops import rearrange, repeat
 
 from diffusers.models.attention import _chunked_feed_forward
 from diffusers.models.attention import *
 
-from .mvmm_attention_processor import JointMVAttnProcessor2_0, XFormersMVAttnProcessor, XFormersJointAttnProcessor
+from .mvmm_attention_processor import (
+    JointMVAttnProcessor2_0,
+    JointTaskAttnProcessor2_0,
+    MVMMAttnProcessor2_0,
+    XFormersMVAttnProcessor,
+    XFormersJointAttnProcessor,
+)
 
 from diffusers.utils import logging
 logger = logging.get_logger(__name__)
@@ -193,14 +205,14 @@ class JointMVTransformerBlock(nn.Module):
 # The only modifications: `AttnProcessor2_0` -> `CustomAttention` or 'CustomJointAttention'
 class CustomAttention(Attention):
     def set_use_memory_efficient_attention_xformers(self, use_memory_efficient_attention_xformers: bool, *args, **kwargs):
-        processor = XFormersMVAttnProcessor()
-        self.set_processor(processor)
+        # xformers is unavailable on recent Colab/PyTorch stacks; SDPA is an
+        # equivalent drop-in replacement.
+        self.set_processor(MVMMAttnProcessor2_0())
 
 
 class CustomJointAttention(Attention):
     def set_use_memory_efficient_attention_xformers(self, use_memory_efficient_attention_xformers: bool, *args, **kwargs):
-        processor = XFormersJointAttnProcessor()
-        self.set_processor(processor)
+        self.set_processor(JointTaskAttnProcessor2_0())
         
 @maybe_allow_in_graph
 class BasicMVMMTransformerBlock(nn.Module):
@@ -344,7 +356,7 @@ class BasicMVMMTransformerBlock(nn.Module):
             cross_attention_dim=cross_attention_dim if only_cross_attention else None,
             upcast_attention=upcast_attention,
             out_bias=True,
-            processor=XFormersMVAttnProcessor(),
+            processor=MVMMAttnProcessor2_0(),
         )
 
         if self.cd_attention_mid:
@@ -357,7 +369,7 @@ class BasicMVMMTransformerBlock(nn.Module):
                 bias=attention_bias,
                 cross_attention_dim=cross_attention_dim if only_cross_attention else None,
                 upcast_attention=upcast_attention,
-                processor=XFormersJointAttnProcessor(),
+                processor=JointTaskAttnProcessor2_0(),
             )
             nn.init.zeros_(self.attn_joint_mid.to_out[0].weight.data)
             self.norm_joint_mid = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)

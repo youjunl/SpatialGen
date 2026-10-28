@@ -2,13 +2,11 @@ from typing import *
 from PIL.Image import Image as PILImage
 from numpy import ndarray
 from torch import Tensor
-from wandb import Image as WandbImage
 
 from PIL import Image
 import numpy as np
 import torch
 from einops import rearrange
-import wandb
 import matplotlib.pyplot as plt
 
 
@@ -16,12 +14,14 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def wandb_mvimage_log(outputs: Dict[str, Tensor], max_num: int = 4, max_view: int = 8) -> List[WandbImage]:
+def wandb_mvimage_log(outputs: Dict[str, Tensor], max_num: int = 4, max_view: int = 8) -> List[Any]:
     """Organize multi-view images in Dict `outputs` for wandb logging.
 
     Only process values in Dict `outputs` that have keys containing the word "images",
     which should be in the shape of (B, V, 3, H, W).
     """
+    import wandb
+
     formatted_images = []
     for k in outputs.keys():
         if "images" in k and outputs[k] is not None:  # (B, V, 3, H, W)

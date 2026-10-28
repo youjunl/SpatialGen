@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import os.path as osp
 
@@ -5,7 +7,10 @@ import random
 from copy import deepcopy
 import torch
 import numpy as np
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:  # optional; only needed by the point-cloud export helpers
+    o3d = None
 from PIL import Image
 import torchvision
 from einops import rearrange

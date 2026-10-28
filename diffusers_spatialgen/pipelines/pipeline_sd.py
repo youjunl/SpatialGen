@@ -13,14 +13,28 @@ from packaging import version
 from transformers import AutoImageProcessor
 import torch.nn.functional as tF
 
-from diffusers import AutoencoderKL, DiffusionPipeline, AutoencoderTiny
-from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
-from diffusers.schedulers import KarrasDiffusionSchedulers
-from diffusers.utils import (
-    deprecate,
-    is_accelerate_available,
-    is_accelerate_version,
-)
+from diffusers import AutoencoderKL, DiffusionPipeline
+try:
+    from diffusers import AutoencoderTiny
+except ImportError:
+    AutoencoderTiny = None
+try:
+    from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
+except ImportError:
+    from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
+
+    StableDiffusionSafetyChecker = object
+try:
+    from diffusers.schedulers import KarrasDiffusionSchedulers
+except ImportError:
+    KarrasDiffusionSchedulers = object
+from diffusers.utils import deprecate, is_accelerate_available
+try:
+    from diffusers.utils import is_accelerate_version
+except ImportError:
+
+    def is_accelerate_version(*args, **kwargs) -> bool:
+        return True
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.utils import logging
 from diffusers.configuration_utils import FrozenDict
@@ -121,7 +135,10 @@ class SpatialGenDiffusionPipeline(DiffusionPipeline):
             deprecate("steps_offset!=1", "1.0.0", deprecation_message, standard_warn=False)
             new_config = dict(scheduler.config)
             new_config["steps_offset"] = 1
-            scheduler._internal_dict = FrozenDict(new_config)
+            try:
+                scheduler._internal_dict = FrozenDict(new_config)
+            except Exception:
+                pass
 
         if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is True:
             deprecation_message = (
@@ -134,7 +151,10 @@ class SpatialGenDiffusionPipeline(DiffusionPipeline):
             deprecate("clip_sample not set", "1.0.0", deprecation_message, standard_warn=False)
             new_config = dict(scheduler.config)
             new_config["clip_sample"] = False
-            scheduler._internal_dict = FrozenDict(new_config)
+            try:
+                scheduler._internal_dict = FrozenDict(new_config)
+            except Exception:
+                pass
 
         # if safety_checker is None and requires_safety_checker:
         #     logger.warning(
@@ -171,7 +191,10 @@ class SpatialGenDiffusionPipeline(DiffusionPipeline):
             deprecate("sample_size<64", "1.0.0", deprecation_message, standard_warn=False)
             new_config = dict(unet.config)
             new_config["sample_size"] = 64
-            unet._internal_dict = FrozenDict(new_config)
+            try:
+                unet._internal_dict = FrozenDict(new_config)
+            except Exception:
+                pass
 
         self.register_modules(
             vae=vae,
@@ -442,7 +465,7 @@ class SpatialGenDiffusionPipeline(DiffusionPipeline):
         if use_depth_vae:
             if isinstance(self.depth_vae, AutoencoderKL):
                 latents = latents / self.depth_vae.config.scaling_factor
-            elif isinstance(self.depth_vae, AutoencoderTiny):
+            elif AutoencoderTiny is not None and isinstance(self.depth_vae, AutoencoderTiny):
                 latents = latents
         else:
             latents = latents / self.vae.config.scaling_factor
