@@ -1441,12 +1441,10 @@ class UNetMVMM2DConditionModel(
             "framework": "pytorch",
         }
 
-        # load config
-        config, unused_kwargs, commit_hash = cls.load_config(
-            config_path,
+        # load config (`return_commit_hash` was removed from newer diffusers)
+        load_config_kwargs = dict(
             cache_dir=cache_dir,
             return_unused_kwargs=True,
-            return_commit_hash=True,
             force_download=force_download,
             proxies=proxies,
             local_files_only=local_files_only,
@@ -1456,6 +1454,13 @@ class UNetMVMM2DConditionModel(
             user_agent=user_agent,
             **kwargs,
         )
+        try:
+            config, unused_kwargs, commit_hash = cls.load_config(
+                config_path, return_commit_hash=True, **load_config_kwargs
+            )
+        except (TypeError, ValueError):
+            config, unused_kwargs = cls.load_config(config_path, **load_config_kwargs)
+            commit_hash = None
 
         # Modify configs for the multi-view cross-domain diffusion model
         config["_class_name"] = cls.__name__
@@ -1708,7 +1713,10 @@ class UNetMVMM2DConditionModel(
                     state_dict = load_state_dict(model_file)
                     if hasattr(model, "_convert_deprecated_attention_blocks"):
                         model._convert_deprecated_attention_blocks(state_dict)
-                    state_dict_original = copy.deepcopy(state_dict)
+                    # Only `conv_in.weight` is needed after loading. Deep-copying the
+                    # whole state dict doubles host RAM (the checkpoint is ~1.8 GB)
+                    # and OOMs a 12 GB Colab VM.
+                    conv_in_weight_original = state_dict["conv_in.weight"].clone()
 
                     try:
                         model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
@@ -1735,7 +1743,11 @@ class UNetMVMM2DConditionModel(
                         missing_keys = [key for key in model_sd if key not in filtered_state_dict]
                         unexpected_keys = [key for key in state_dict if key not in model_sd]
                         model.load_state_dict(filtered_state_dict, strict=False)
+                        del filtered_state_dict
                         error_msgs = []
+
+                    # Free the host copy before converting the model to fp16.
+                    del state_dict
 
                     loading_info = {
                         "missing_keys": missing_keys,
@@ -1754,7 +1766,7 @@ class UNetMVMM2DConditionModel(
         if not from_scratch:
             # Handle initilizations for some layers
             ## Input conv
-            conv_in_weight = state_dict_original["conv_in.weight"]
+            conv_in_weight = conv_in_weight_original
             latent_channels = conv_in_weight.shape[1]
             if model.conv_in.weight.data.shape[1] != latent_channels:
                 # Initialize from the original weights
