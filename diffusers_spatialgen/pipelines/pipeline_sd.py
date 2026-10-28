@@ -1000,12 +1000,34 @@ class SpatialGenDiffusionPipeline(DiffusionPipeline):
 
                 # predict the noise residual
                 # Input: (B, 21, H, W), Output: (B, 4, H, W)
-                noise_pred = self.unet(
-                    latent_model_input,
-                    timestep_all,
-                    encoder_hidden_states=prompt_embeds,  # Bxnum_tasks, 77, 1024
-                    class_labels=task_embeddings,
-                ).sample
+                # Run the negative and positive CFG branches as separate
+                # forward passes.  The batch is (2 * B * num_tasks * views)
+                # = 160 at 512x512, which does not fit on a 16 GB T4.  The
+                # branches never attend to each other (MV attention groups
+                # by `(b v)`), so splitting them is numerically equivalent.
+                if do_classifier_free_guidance:
+                    half = latent_model_input.shape[0] // 2
+                    noise_pred_uncond = self.unet(
+                        latent_model_input[:half],
+                        timestep_all[:half],
+                        encoder_hidden_states=prompt_embeds[:half],
+                        class_labels=task_embeddings[:half],
+                    ).sample
+                    noise_pred_img = self.unet(
+                        latent_model_input[half:],
+                        timestep_all[half:],
+                        encoder_hidden_states=prompt_embeds[half:],
+                        class_labels=task_embeddings[half:],
+                    ).sample
+                    noise_pred = torch.cat([noise_pred_uncond, noise_pred_img], dim=0)
+                    del noise_pred_uncond, noise_pred_img
+                else:
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        timestep_all,
+                        encoder_hidden_states=prompt_embeds,  # Bxnum_tasks, 77, 1024
+                        class_labels=task_embeddings,
+                    ).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:

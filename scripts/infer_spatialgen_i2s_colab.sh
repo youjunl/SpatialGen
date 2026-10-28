@@ -14,6 +14,8 @@ set -euo pipefail
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 # Makes CUDA errors synchronous; useful while bringing up a new runtime.
 export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-1}
+# Reduce allocator fragmentation on the 16 GB T4.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 : "${CKPT_DIR:?set CKPT_DIR to the SpatialGen-1.0 checkpoint directory}"
 : "${TEST_DATA_DIR:?set TEST_DATA_DIR to the SpatialGen-Testset directory}"
