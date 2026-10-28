@@ -469,7 +469,14 @@ class SpatialGenDiffusionPipeline(DiffusionPipeline):
                 latents = latents
         else:
             latents = latents / self.vae.config.scaling_factor
-        image = vae.decode(latents).sample
+        # Decode in small chunks to bound activation memory: at 512x512 the
+        # batch can contain all tasks x views (80 images), and a single
+        # decode call needs >3 GiB for one activation on a 16 GB T4.
+        decoded = []
+        for chunk in torch.split(latents, 4, dim=0):
+            decoded.append(vae.decode(chunk).sample)
+        image = torch.cat(decoded, dim=0)
+        del decoded
         if image.shape[1] == 4:
             print(f"Using 4 channels VAE output, the 4th channel is for depth_confidence")
             confi_map = image[:, 3:4, :, :]
