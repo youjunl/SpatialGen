@@ -25,7 +25,7 @@ from transformers import PreTrainedModel, PretrainedConfig
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config, FrozenDict
 from diffusers.utils import deprecate
-from diffusers.models.attention_processor import Attention, XFormersAttnProcessor
+from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from src.utils.typing import *
 
 # helpers
@@ -97,7 +97,7 @@ class CustomTransformer(nn.Module):
                         bias=False,
                         cross_attention_dim=None,
                         upcast_attention=False,
-                        processor=XFormersAttnProcessor(),
+                        processor=AttnProcessor2_0(),
                     ),
                 FeedForward(dim, mlp_dim)
             ]))
